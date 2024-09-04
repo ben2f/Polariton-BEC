@@ -1,0 +1,21 @@
+  New Real time propagation 1d 
+
+  Nonlinearity G_1D =    -10.0000, Linear L/G =       0.0000, NL L/G =       0.0000
+  Parameter of trap: GAMMA =   0.01
+
+# Space Stp:  N =     4000
+  Space Step: DX =   0.025000
+# Time Stp : NSTP =   1000000, NPAS =      1000, NRUN =    160000
+  Time Step:   DT =   0.000625
+
+                   -----------------------------------------------------
+                    Norm      Chem        Ener/N      <x>      |Psi(0)|^2
+                   -----------------------------------------------------
+Initial :          1.0000    0.007500    0.000000    7.07107    0.05642
+After NSTP iter.:  1.0000  116.863655  130.003640    7.07107    0.05642
+After NPAS iter.:  1.0000  118.606073  128.962124    7.07107    0.05642
+After NRUN iter.:  1.0000  204.644001  222.786748    7.07107    0.05642
+                   -----------------------------------------------------
+
+ Clock Time:   1396 seconds
+   CPU Time:   1395 seconds
