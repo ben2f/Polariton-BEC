@@ -1,0 +1,547 @@
+!# File name : spectral1d.f90	
+!# Last modified : 05 Sep 2021
+module FFTW3
+  use, intrinsic :: iso_c_binding
+  include 'fftw3.f03'
+end module
+
+MODULE COMM_DATA
+  !INTEGER, PARAMETER :: INPUT = 0, IMAG_TIME = 1
+  INTEGER, PARAMETER :: INPUT = 1, IMAG_TIME = 0
+  INTEGER, PARAMETER :: NRUN = 8 * 125000, LSTORE = 4000, IMSTORE = NRUN / 5
+  INTEGER, PARAMETER :: INTERACTION = 100000
+
+  INTEGER, PARAMETER :: NX = 4096 , NXX = NX-1, NX2 = NX/2
+  REAL (8), PARAMETER :: LX = 40.96D0
+  REAL (8), PARAMETER :: PI = 3.14159265358979D0, TWO_PI = 2.0D0 * PI 
+  COMPLEX (8), PARAMETER :: CI_ = (0.0D0, 1.0D0)
+  COMPLEX :: CI
+END MODULE COMM_DATA
+
+MODULE GPE_DATA
+  USE COMM_DATA, ONLY : TWO_PI, LX, NX, PI
+  REAL (8), PARAMETER :: DX = LX / NX
+  REAL (8), PARAMETER :: DKX = TWO_PI/LX
+!  			
+  REAL (8), PARAMETER :: NU = 1.0D0, NU2 = NU * NU
+ ! REAL (8), PARAMETER :: G0 = -10D0, G01 = 0.0142D0, GAM_EFF0 = 0.01D0
+!  REAL (8), PARAMETER :: G0 = -1.0D0, G01 = 1.0D-4, GAM_EFF0 = 5.0D-5
+  REAL (8), PARAMETER :: G0 = -1.0D0, G01 = 0.01D0, GAM_EFF0 = 1.0D-5
+! Fig.  G0         G01         GAM_EFF         Case        Inference
+! 4a	+10          0           0               (a)         Expand
+! 4b    -10          0           0               (b)         Stable
+!
+! 5a    +10          1           0               (a)         Stable - Expand
+! 5b    +10          1           0.1             (b)         Stable - Expand
+! 5c    +10          1           0.2             (c)         Stable - Expand
+! 5d    +10          1           0.4             (d)         Stable - Expand
+!
+  REAL (8), DIMENSION(:), ALLOCATABLE :: X, X2
+  REAL (8), DIMENSION(:), ALLOCATABLE :: KX, KX2
+  REAL (8), DIMENSION(:), ALLOCATABLE :: V, R2
+  COMPLEX (8), DIMENSION(:), ALLOCATABLE :: CP, KIN
+  REAL (8) :: DT, G, G1, GAM_EFF
+END MODULE GPE_DATA
+
+PROGRAM ODGPE_FFT1D
+  USE FFTW3 !, ONLY : C_PTR, C_INT, FFTW_FORWARD, FFTW_BACKWARD, &
+            !FFTW_ESTIMATE, FFTW_PLAN_DFT_1D, FFTW_DESTROY_PLAN
+  USE COMM_DATA, ONLY : INTERACTION, NRUN, LSTORE, IMSTORE, IMAG_TIME, CI, NX, NX2, INPUT
+  USE GPE_DATA
+  IMPLICIT NONE
+!------------------------ interface blocks -----------------------       
+  INTERFACE 
+    SUBROUTINE ALLOCATE_VARIABLES()
+    END SUBROUTINE ALLOCATE_VARIABLES
+ 
+    SUBROUTINE FREE_VARIABLES()
+    END SUBROUTINE FREE_VARIABLES
+  
+    SUBROUTINE INITIALIZE()
+    END SUBROUTINE INITIALIZE
+ 
+    SUBROUTINE CALCULATE_TRAP()
+    END SUBROUTINE CALCULATE_TRAP
+  
+    SUBROUTINE CALCULATE_VDD()
+    END SUBROUTINE CALCULATE_VDD
+  
+    SUBROUTINE EODE(DT, CP)
+      COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: CP
+      REAL (8), INTENT(IN) :: DT
+    END SUBROUTINE EODE
+   
+    SUBROUTINE NORM(CP, ZNORM)
+      COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: CP
+      REAL (8), INTENT(OUT) :: ZNORM
+    END SUBROUTINE NORM
+ 
+    SUBROUTINE RAD(CP2, RMS)
+      REAL (8), DIMENSION(:), INTENT(IN) :: CP2
+      REAL (8), INTENT(OUT) :: RMS
+    END SUBROUTINE RAD
+  
+    SUBROUTINE CHEM(CP, MU, EN)
+      COMPLEX (8), DIMENSION(:), INTENT(IN) :: CP
+      REAL (8), INTENT(OUT) :: MU, EN
+    END SUBROUTINE CHEM
+
+    SUBROUTINE EFFTW(PLAN1, PLAN2, KIN, U) 
+      USE FFTW3, ONLY : C_PTR
+      TYPE(C_PTR) :: PLAN1, PLAN2
+      COMPLEX (8), DIMENSION(:), INTENT(IN) :: KIN
+      COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: U
+    END SUBROUTINE EFFTW
+
+    SUBROUTINE RESIDUE(CP, MU, RES)
+      IMPLICIT NONE
+      COMPLEX (8), DIMENSION(:), INTENT(IN) :: CP
+      REAL (8), INTENT(IN) :: MU
+      COMPLEX (8), DIMENSION(SIZE(CP)), INTENT(INOUT) :: RES
+     END SUBROUTINE RESIDUE
+
+  END INTERFACE
+!-------------------- END INTERFACE BLOCKS -----------------------
+  TYPE(C_PTR) :: PLAN1, PLAN2
+  INTEGER :: I, L
+  REAL (8), DIMENSION(:), ALLOCATABLE :: CP2
+  COMPLEX (8), DIMENSION(:), ALLOCATABLE :: S, STMP, RES
+  REAL (8) :: RMS
+  REAL (8) :: ZNORM, MU, EN, T, T1, DT2, T2 
+  REAL (8) :: G1STP, GAMSTP, TI, TMPR, TMPC 
+  INTEGER :: CLCK_COUNTS_BEG, CLCK_COUNTS_END, CLCK_RATE
+!  
+  CALL SYSTEM_CLOCK (CLCK_COUNTS_BEG, CLCK_RATE)
+  CALL CPU_TIME (T1)
+!
+  G = 0.0D0
+  G1 = 0.0D0
+! 
+  CALL ALLOCATE_VARIABLES()
+  ALLOCATE(CP2(1:NX))
+  ALLOCATE(S(1:NX))
+  ALLOCATE(STMP(1:NX))
+  ALLOCATE(RES(1:NX))
+!  
+  SELECT CASE(IMAG_TIME)
+    CASE (0)
+      OPEN(7, file='real1d-out.txt', status='unknown')
+      WRITE(7, *) ' ****************** realtime propagation ******************'
+      DT = DX * DX
+    CASE (1)
+      OPEN(7, file='imag1d-out.txt', status='unknown')
+      WRITE(7, *) ' ****************** imagtime propagation ******************'
+      DT = DX * DX / 10.0D0
+  END SELECT
+  WRITE(7,*) 
+
+  WRITE(7,903) G0, G01
+  WRITE(7,904) NU
+  WRITE(7,*)
+  WRITE(7,905) NX
+  WRITE(7,906) DX, DT
+  !WRITE(7,907) NSTP, NPAS, NRUN  
+  !WRITE(7,909) CUTOFF 
+  WRITE(7,*)
+  903 FORMAT('  Nonlinearity G =', F11.4, ', Strength of G1 =', F12.5)
+  904 FORMAT('  Parameters of trap: NU = ',F7.4)
+  905 FORMAT(' # Space Stp: NX = ', I8)
+  906 FORMAT('  Space Step: DX = ', F10.6, ', Time Step:   DT = ', F10.6)
+  !907 FORMAT(' # Time Stp : NSTP = ',I9,', NPAS = ',I9,', NRUN = ',I9)
+!
+  CALL INITIALIZE()
+  CALL CALCULATE_TRAP()
+!
+  CALL NORM(CP, ZNORM)
+  IF (IMAG_TIME == 1) THEN
+    CALL CHEM(CP, MU, EN)
+    CALL RESIDUE(CP, MU, RES)
+    OPEN(50, file='imag1d-ini.txt', status='unknown')
+  END IF
+!  
+  G = G0
+  SELECT CASE(IMAG_TIME)
+    CASE (0)
+      G1 = G01
+    CASE (1)
+      G1 = 0.0D0
+  END SELECT
+  
+  IF (IMAG_TIME == 0) THEN
+    CALL CHEM(CP, MU, EN)
+  END IF
+!
+  IF (INPUT == 2) THEN 
+    !DO I = 1, NX
+    !  READ(45, 3000) TMPR, TMPC
+    !  CP(I) = CMPLX(TMPR, TMPC)
+    !END DO
+   ! CLOSE(45)
+    DO I = 1, NX
+      READ(*, 3000) TMPR, TMPC
+      CP(I) = CMPLX(SQRT(TMPC), 0.0D0, 8)
+    END DO
+  END IF
+  
+  CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  CALL RAD(CP2, RMS)
+!  
+  WRITE (7, 1001)
+  WRITE (7, 1002)
+  WRITE (7, 1001)
+  WRITE (7, 1003) ZNORM, MU, EN, RMS, CP2(NX2) 
+  1001 FORMAT (19X,'-----------------------------------------------------')
+  1002 FORMAT (20X, 'Norm', 7X, 'Chem', 7X, 'Ener/N', 6X, '<r>', 4X, '|Psi(0)|^2')
+  1003 FORMAT ('Initial : ', 4X, F11.4, 2F12.4, 2F11.4)
+! 
+! Initial Profile
+  CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  DO I = 1, NX
+    WRITE(50, 2001) X(I),  CP2(I), RES(I)
+  END DO
+  WRITE(50, 2001) X(NX) + DX, CP2(1), RES(1) ! to makeup last point
+  CLOSE(50)
+! 
+  SELECT CASE(IMAG_TIME)
+    CASE (0)
+      CI = (0.0D0, 1.0D0)
+    CASE (1)
+      CI = (1.0D0, 0.0D0)
+  END SELECT
+! 
+  PLAN1 = FFTW_PLAN_DFT_1D(NX, S, STMP, FFTW_FORWARD, FFTW_ESTIMATE)
+  PLAN2 = FFTW_PLAN_DFT_1D(NX, S, STMP, FFTW_BACKWARD, FFTW_ESTIMATE)
+!  
+  DO I = 1, NX
+    KIN(I) = EXP(-CI * DT * KX2(I) / 2.0D0)      
+  END DO
+!
+  TI = 0.0D0
+  DT2 = DT / 2.0D0 
+!
+! Introduce nonlinearities (G1) in time
+  G = G0 ! 0.0D0
+  G1 = 0.0D0
+  GAM_EFF = 0.0D0
+  T = 0.0D0
+  IF (IMAG_TIME == 0) THEN !changed to 0 from 5 on oct 2SSS
+    !GSTP =  G0 / INTERACTION
+    G1STP = G01 / INTERACTION
+    GAMSTP = GAM_EFF0 / INTERACTION
+    DO L = 1, INTERACTION
+      !$OMP PARALLEL DO PRIVATE(I)
+      DO I = 1, NX
+         V(I) = (INTERACTION - L) * (1.0D0/INTERACTION) * (X2(I) * NU2 / 2.0D0)
+         !V(I) = (X2(I)*NU2)
+      END DO
+      !$OMP END PARALLEL DO
+      !G = G + GSTP
+      G1 = G1 + G1STP
+      GAM_EFF = GAM_EFF + GAMSTP
+      CALL EODE(DT, CP)  
+      CALL EFFTW(PLAN1, PLAN2, KIN, CP) 
+      !IF (MOD(L, LSTORE) == 0) THEN
+        !CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+        !CALL NORM(CP,ZNORM)
+        !CALL RAD(CP2, RMS)
+        !CALL CHEM(CP, MU, EN)
+      !END IF     
+    END DO
+  END IF
+  CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  TI = 0.0D0
+!
+  IF (IMAG_TIME == 0) THEN
+      OPEN(15, file='real1d-dyn.txt', status='unknown')
+      DO I = 1, NX, 4
+        WRITE(15, 1000) X(I), TI, CP2(I)
+      END DO
+      WRITE(15, 1000) X(NX) + DX, TI, CP2(1)
+      WRITE (15, *)
+  END IF
+!
+  SELECT CASE(IMAG_TIME)
+    CASE (0)
+      DO L = 1, NRUN
+        CALL EODE(DT2, CP)  
+        CALL EFFTW(PLAN1, PLAN2, KIN, CP) 
+        CALL EODE(DT2, CP) 
+        TI = TI + DT
+        IF (MOD(L, LSTORE) == 0) THEN 
+          CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+          CALL CHEM(CP, MU, EN)
+          CALL RAD(CP2, RMS)
+          DO I = 1, NX, 4
+            WRITE(15, 1000) X(I), TI, CP2(I)
+          END DO
+          WRITE(15, 1000) X(NX) + DX, TI, CP2(1)
+          WRITE (15, *)
+          OPEN(16, file='real1d-rms.txt', status='unknown')
+          WRITE(16, 2222) TI, RMS
+          WRITE (7, 1005) ZNORM, MU, EN, RMS, CP2(NX2)
+        END IF
+      END DO
+      CLOSE(15)
+      CLOSE(16)
+    CASE (1)
+      DO L = 1, NRUN
+        CALL EODE(DT2, CP)  
+        CALL EFFTW(PLAN1, PLAN2, KIN, CP) 
+        CALL EODE(DT2, CP)  
+        CALL NORM(CP, ZNORM)
+        CP2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+        CALL CHEM(CP, MU, EN)
+        CALL RAD(CP2, RMS)
+        IF (MOD(L, IMSTORE) == 0) WRITE (7, 1005) ZNORM, MU, EN, RMS, CP2(NX2)
+      END DO
+      CALL RESIDUE(CP, MU, RES)
+      OPEN(15, file='imag1d-fin.txt', status='unknown')
+      DO I = 1, NX
+        WRITE(15, 2001) X(I),  CP2(I), RES(I)
+      END DO
+      WRITE(15, 2001) X(NX) + DX, CP2(1), RES(1) ! to makeup last point
+      CLOSE(15)
+  END SELECT
+!
+  1000 FORMAT(2F10.4, F16.8)
+  2001 FORMAT(F12.6, 4G17.8E3)
+  WRITE(*,*) 'Strength of GF = ', G
+  WRITE(*,*) 'Strength of G1F = ', G1 
+!
+  2222 FORMAT(F12.6, F12.6)
+  WRITE (7, 1005) ZNORM, MU, EN, RMS, CP2(NX2)
+  WRITE (7, 1001)
+  1005 FORMAT('After NPAS iter.:', F8.4, 2F12.4, 3F11.4)
+  SELECT CASE(IMAG_TIME)
+    CASE (0)
+      OPEN(45, file='real1d-raw.txt', status='unknown')
+      DO I = 1, NX
+        WRITE(45, 3000) REAL(CP(I)), AIMAG(CP(I))
+      END DO
+    CASE (1)
+      OPEN(45, file='imag1d-raw.txt', status='unknown')
+      DO I = 1, NX
+        WRITE(45, 3000) REAL(CP(I)), AIMAG(CP(I))
+      END DO
+  END SELECT
+  CLOSE(45)
+!
+  3000 FORMAT(G17.8E3, 1X, G17.8E3)
+  CALL FREE_VARIABLES()
+  IF (ALLOCATED(CP2)) DEALLOCATE(CP2)
+  IF (ALLOCATED(S)) DEALLOCATE(S)
+  IF (ALLOCATED(STMP)) DEALLOCATE(STMP)
+  IF (ALLOCATED(RES)) DEALLOCATE(RES)
+!s
+  CALL FFTW_DESTROY_PLAN(PLAN1)
+  CALL FFTW_DESTROY_PLAN(PLAN2)
+!
+  CALL SYSTEM_CLOCK (CLCK_COUNTS_END, CLCK_RATE)
+  CALL CPU_TIME(T2)
+  WRITE (7,*)
+  WRITE (7,'(A,I7,A)') ' Clock Time: ', (CLCK_COUNTS_END - CLCK_COUNTS_BEG)/INT (CLCK_RATE,8), ' seconds'
+  WRITE (7,'(A,I7,A)') '   CPU Time: ', INT(T2-T1), ' seconds' 
+  CLOSE(7)
+  
+END PROGRAM ODGPE_FFT1D
+!
+SUBROUTINE ALLOCATE_VARIABLES()
+  USE COMM_DATA, ONLY : NX
+  USE GPE_DATA, ONLY : X,X2, V, CP, R2, KIN, KX, KX2
+  IMPLICIT NONE
+  ALLOCATE(X(1:NX))   
+  ALLOCATE(X2(1:NX))   
+  ALLOCATE(V(1:NX))
+  ALLOCATE(CP(1:NX))
+  ALLOCATE(R2(1:NX))
+  ALLOCATE(KIN(1:NX))
+  ALLOCATE(KX(1:NX))
+  ALLOCATE(KX2(1:NX))
+END SUBROUTINE ALLOCATE_VARIABLES
+!
+SUBROUTINE FREE_VARIABLES()
+  USE GPE_DATA, ONLY : X, X2, V, CP, R2, KIN, KX, KX2
+  IMPLICIT NONE
+  IF (ALLOCATED(X)) DEALLOCATE(X)   
+  IF (ALLOCATED(X2)) DEALLOCATE(X2)   
+  IF (ALLOCATED(V)) DEALLOCATE(V)
+  IF (ALLOCATED(CP)) DEALLOCATE(CP)
+  IF (ALLOCATED(R2)) DEALLOCATE(R2)
+  IF (ALLOCATED(KX)) DEALLOCATE(KX)
+  IF (ALLOCATED(KX2)) DEALLOCATE(KX2)
+  IF (ALLOCATED(KIN)) DEALLOCATE(KIN)
+END SUBROUTINE FREE_VARIABLES
+! 
+SUBROUTINE INITIALIZE()
+  USE COMM_DATA, ONLY : LX, NX, NXX, NX2, PI, TWO_PI
+  USE GPE_DATA, ONLY : DX, NU, X, X2, R2, CP, DKX, KX, KX2
+  IMPLICIT NONE
+  REAL (8) :: PI2, PI4!, AA, RR2
+  INTEGER :: I
+!
+  PI2 = SQRT(PI/NU)
+  PI4 = SQRT(SQRT(PI/NU))
+!
+  FORALL (I=1:NX) X(I) = - LX / 2.0D0 + (I-1) * DX
+  X2 = X * X  
+  DO I = 1, NX2
+    KX(I) = (I - 1) * TWO_PI / LX
+    KX(NX2+I) = -(NX2 - I + 1) * TWO_PI / LX 
+  END DO
+!
+  KX2 = KX * KX
+  DO I = 1, NX
+    R2(I) = X2(I)
+  END DO
+  DO I = 1, NX
+    !AA = SQRT(1.0D0/SQRT(2.0D0))
+    !RR2 = 2.0D0
+    !CP(I) = AA * EXP( -X2(I) / (2.0D0 * RR2)) / PI4
+    CP(I) = EXP(-NU * X2(I) / 2.0D0) / PI4
+  END DO
+END SUBROUTINE INITIALIZE
+
+SUBROUTINE CALCULATE_TRAP()
+  USE COMM_DATA, ONLY : NX
+  USE GPE_DATA, ONLY :  NU2, V, X2
+  IMPLICIT NONE
+  INTEGER :: I
+  !$OMP PARALLEL DO PRIVATE(I)
+  DO I = 1, NX
+    V(I) = NU2 * X2(I) / 2.0D0
+  END DO
+  !$OMP END PARALLEL DO
+END SUBROUTINE CALCULATE_TRAP
+
+SUBROUTINE EODE(DT, CP) ! Exact solution
+  USE COMM_DATA, ONLY : CI_, CI, IMAG_TIME, NX, NXX
+  USE GPE_DATA, ONLY : V, G, G1, GAM_EFF
+  IMPLICIT NONE
+!-------------------------------------------------
+  COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: CP
+  REAL (8), INTENT(IN) :: DT
+  REAL (8), DIMENSION(SIZE(CP)) :: P2
+  COMPLEX (8), DIMENSION(SIZE(CP)) :: TMP1D
+  COMPLEX (8) :: GMCIG1, CDT
+  INTEGER :: I
+!   
+  P2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  GMCIG1 = G - CI_ * G1
+  CDT = CI * DT
+  !$OMP DO PRIVATE(I)
+  DO I = 1, NX
+    !TMP1D(I) = V(I) + G * P2(I) + CI_ * GAM_EFF - CI_* G1 * P2(I) 
+    TMP1D(I) = V(I) + GMCIG1 * P2(I) + CI_ * GAM_EFF
+    CP(I) = CP(I) * EXP(-CDT * TMP1D(I))
+  END DO
+  !$OMP END DO
+END SUBROUTINE EODE
+
+SUBROUTINE EFFTW(PLAN1, PLAN2, KIN, U) 
+  USE COMM_DATA, ONLY : NX
+  USE FFTW3, ONLY : C_PTR, C_INT, FFTW_EXECUTE_DFT
+  IMPLICIT NONE
+  COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: U
+  COMPLEX (8), DIMENSION(:), INTENT(IN) :: KIN
+  COMPLEX (8), DIMENSION(NX) :: S, STMP
+  TYPE(C_PTR) :: PLAN1, PLAN2
+  S = U
+  CALL FFTW_EXECUTE_DFT(PLAN1, S, STMP)
+  S = KIN * STMP
+  CALL FFTW_EXECUTE_DFT(PLAN2, S, STMP)
+  U = STMP / NX
+END SUBROUTINE EFFTW
+
+SUBROUTINE NORM(CP, ZNORM)
+!  Calculates the normalization of the wave function and sets it to unity.
+  USE COMM_DATA, ONLY : IMAG_TIME, NX
+  USE GPE_DATA, ONLY : DX
+  USE UTIL, ONLY : SIMP
+  IMPLICIT NONE
+  COMPLEX (8), DIMENSION(:), INTENT(INOUT) :: CP
+  REAL (8), INTENT(OUT) :: ZNORM
+
+  REAL (8), DIMENSION(SIZE(CP)) :: P2
+!
+  P2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  ZNORM = SIMP(P2, DX)
+  IF (IMAG_TIME == 1) CP = CP / SQRT(ZNORM)
+ END SUBROUTINE NORM
+
+SUBROUTINE RAD(CP2, R)
+! Calculates the root mean square size RMS
+  USE COMM_DATA, ONLY : NX
+  USE GPE_DATA, ONLY : DX, X2
+  USE UTIL, ONLY : SIMP
+  IMPLICIT NONE
+  REAL (8), DIMENSION(:), INTENT(IN) :: CP2
+  REAL (8), INTENT(OUT) :: R
+
+  INTEGER :: I
+  REAL (8), DIMENSION(SIZE(CP2)) :: TMP1D
+!
+  !$OMP PARALLEL DO PRIVATE(I)
+  DO I = 1, NX
+    TMP1D(I) = X2(I) * CP2(I)
+  END DO
+  !$OMP END PARALLEL DO
+  R = SQRT(SIMP(TMP1D, DX))
+END SUBROUTINE RAD
+
+SUBROUTINE CHEM(CP, MU, EN)
+  USE COMM_DATA, ONLY : CI
+  USE GPE_DATA, ONLY : V, G, G1, GAM_EFF, DX
+  USE UTIL, ONLY : DIFF, SIMP
+  IMPLICIT NONE
+  COMPLEX (8), DIMENSION(:), INTENT(IN) :: CP
+  REAL (8), INTENT(OUT) :: MU, EN
+!----------------------------------------------------------------------
+!  INTERFACE 
+!    PURE FUNCTION DIFF(P, DX) RESULT (DP)
+!      IMPLICIT NONE
+!      REAL (8), DIMENSION(0:), INTENT(IN) :: P
+!      REAL (8), INTENT(IN) :: DX
+!      REAL (8), DIMENSION(0:SIZE(P)-1) :: DP
+!    END FUNCTION DIFF
+  
+!    PURE FUNCTION SIMP(F, DX) RESULT (VALUE)
+!      IMPLICIT NONE
+!      REAL (8), DIMENSION(0:), INTENT(IN) :: F
+!      REAL (8), INTENT(IN) :: DX
+!      REAL (8) :: VALUE
+!    END FUNCTION SIMP
+!  END INTERFACE
+!----------------------------------------------------------------------
+  COMPLEX (8), DIMENSION(SIZE(CP)) :: DPX
+  REAL (8), DIMENSION(SIZE(CP)) :: P2, DP2, GP2, G1P2
+  COMPLEX (8), DIMENSION(SIZE(CP)) :: TMP1D, EMP1D
+!
+  DPX = DIFF(CP, DX)
+  DP2 = (REAL(DPX) * REAL(DPX) + AIMAG(DPX) * AIMAG(DPX)) / 2.0D0
+  P2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  GP2 = G * P2
+  G1P2 = G1 * P2   
+  TMP1D = (V + GP2 + CI * G1P2 + CI * GAM_EFF)*P2 + DP2 
+  EMP1D = (V + (GP2/2.0D0) + (CI*G1P2/2.0D0) + CI*GAM_EFF)*P2 + DP2
+!    
+  MU = SIMP(REAL(TMP1D), DX)
+  EN = SIMP(REAL(EMP1D), DX)
+END SUBROUTINE CHEM
+
+SUBROUTINE RESIDUE(CP, MU, RES)
+  USE COMM_DATA, ONLY : CI
+  USE GPE_DATA, ONLY : DX, V, G, G1, GAM_EFF
+  USE UTIL, ONLY : DIFF
+  IMPLICIT NONE
+  COMPLEX (8), DIMENSION(:), INTENT(IN) :: CP
+  REAL (8), INTENT(IN) :: MU
+  COMPLEX (8), DIMENSION(SIZE(CP)), INTENT(INOUT) :: RES
+  REAL (8), DIMENSION(SIZE(CP)) :: P2
+  COMPLEX (8), DIMENSION(SIZE(CP)) :: DCP, DP2
+  RES = 0.0D0
+  DCP = DIFF(CP, DX)
+  DP2 = DIFF(DCP, DX) / 2.0D0
+  P2 = REAL(CP) * REAL(CP) + AIMAG(CP) * AIMAG(CP)
+  RES = (V + (G  + CI * G1) * P2 + CI * GAM_EFF - MU) * CP - DP2 
+END SUBROUTINE RESIDUE
+
